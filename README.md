@@ -1,11 +1,5 @@
-# Heavenly Hosts Protocol
-Full Python implementation of the Heavenly Hosts Protocol (HHP) including:
-- Gabriel Cells
-- 4D Funnel DAG
-- Resonance-based fragmented communication
-- Ephemeral dissolution layer
-- Encryption using NaCl
-- Logging and visualization
+# Heavenly Hosts Protocol (HHP)
+HHP is a decentralized protocol of Gabriel Cells organized in a 4D Funnel DAG, designed for resonance-based, ephemeral communication that self-dissolves over time.
 
 ## Usage
 pip install -r requirements.txt
