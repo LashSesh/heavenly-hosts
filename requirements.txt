@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+numpy
+networkx
+matplotlib
+pynacl
+Dockerfile
+dockerfile
