@@ -5,5 +5,3 @@ numpy
 networkx
 matplotlib
 pynacl
-Dockerfile
-dockerfile
