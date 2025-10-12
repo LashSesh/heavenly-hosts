@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import hmac
 import secrets
 import ssl
@@ -63,13 +62,24 @@ def _generate_ephemeral_cert(common_name: str) -> Tuple[bytes, bytes, str]:
 class HHPQuicProtocol(QuicConnectionProtocol):
     """Shared QUIC protocol implementation for both client and server roles."""
 
-    def __init__(self, transport: "HHPTransport", peer: Optional[Peer], *args, **kwargs) -> None:
+    def __init__(
+        self,
+        transport: "HHPTransport",
+        peer: Optional[Peer],
+        *args,
+        **kwargs,
+    ) -> None:
+        expected = kwargs.pop("expected_fingerprint", None)
         super().__init__(*args, **kwargs)
         self._transport = transport
         self.peer = peer
+        self._expected_fingerprint = expected.lower() if expected else None
 
     def quic_event_received(self, event) -> None:  # type: ignore[override]
         if isinstance(event, HandshakeCompleted):
+            if not self._verify_expected_fingerprint():
+                self._quic.close(error_code=0x1, reason_phrase="fingerprint mismatch")
+                return
             if self.peer is None:
                 path = self._quic._network_paths[0]  # type: ignore[attr-defined]
                 self.peer = (path.addr[0], path.addr[1])
@@ -80,6 +90,15 @@ class HHPQuicProtocol(QuicConnectionProtocol):
             self._transport.on_protocol_closed(self)
         else:
             super().quic_event_received(event)
+
+    def _verify_expected_fingerprint(self) -> bool:
+        if not self._expected_fingerprint:
+            return True
+        certificate = getattr(self._quic.tls, "_peer_certificate", None)
+        if certificate is None:
+            return False
+        fingerprint = certificate.fingerprint(hashes.SHA256()).hex().lower()
+        return hmac.compare_digest(fingerprint, self._expected_fingerprint)
 
 
 class HHPTransport:
@@ -213,7 +232,13 @@ class HHPTransport:
                 peer[0],
                 peer[1],
                 configuration=configuration,
-                create_protocol=lambda *a, **kw: HHPQuicProtocol(self, peer, *a, **kw),
+                create_protocol=lambda *a, **kw: HHPQuicProtocol(
+                    self,
+                    peer,
+                    *a,
+                    expected_fingerprint=advertisement.fingerprint,
+                    **kw,
+                ),
             ) as client:
                 await client.wait_connected()
                 self._client_protocols[peer] = client  # type: ignore[assignment]
@@ -304,16 +329,6 @@ class HHPTransport:
     def _client_config(self, advertisement: discovery.PeerAdvertisement) -> QuicConfiguration:
         configuration = QuicConfiguration(is_client=True, alpn_protocols=["hhp/1"])
         configuration.max_datagram_frame_size = self._fragment_size
-        configuration.verify_mode = ssl.CERT_REQUIRED
-        expected = advertisement.fingerprint.lower()
-
-        def _verify_certificate(certificates, _ocsp_response, _scts, _hints) -> None:
-            if not certificates:
-                raise ssl.SSLError("peer certificate missing")
-            fingerprint = hashlib.sha256(certificates[0]).hexdigest().lower()
-            if not hmac.compare_digest(fingerprint, expected):
-                raise ssl.SSLError("peer fingerprint mismatch")
-
-        configuration.verify_certificate = _verify_certificate
+        configuration.verify_mode = ssl.CERT_NONE
         return configuration
 
