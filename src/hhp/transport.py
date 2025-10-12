@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import secrets
 import ssl
 import struct
@@ -26,14 +28,14 @@ from . import cover, discovery
 from .config import Cfg, DEFAULT_FRAGMENT_SIZE
 from .crypto import aead_decrypt, derive_topic_key
 from .dag import DAG
-from .packet import AAD_MAGIC, HDR_FMT, build_fragment, unpack_header
+from .packet import AAD_MAGIC, FLAG_COVER, HDR_FMT, build_fragment, unpack_header
 from .replay import ReplayCache
 from .resonance import tag_vec
 
 Peer = Tuple[str, int]
 
 
-def _generate_ephemeral_cert(common_name: str) -> Tuple[bytes, bytes]:
+def _generate_ephemeral_cert(common_name: str) -> Tuple[bytes, bytes, str]:
     key = ec.generate_private_key(ec.SECP256R1())
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
     now = datetime.utcnow()
@@ -54,7 +56,8 @@ def _generate_ephemeral_cert(common_name: str) -> Tuple[bytes, bytes]:
         serialization.PrivateFormat.TraditionalOpenSSL,
         serialization.NoEncryption(),
     )
-    return cert_pem, key_pem
+    fingerprint = cert.fingerprint(hashes.SHA256()).hex()
+    return cert_pem, key_pem, fingerprint
 
 
 class HHPQuicProtocol(QuicConnectionProtocol):
@@ -101,13 +104,24 @@ class HHPTransport:
         self._server = None
         self._client_tasks: Dict[Peer, asyncio.Task[None]] = {}
         self._client_protocols: Dict[Peer, HHPQuicProtocol] = {}
+        self._peer_advertisements: Dict[Peer, discovery.PeerAdvertisement] = {}
         self._cover_task: Optional[asyncio.Task[None]] = None
         self._tx_counter = 0
-        self._fragment_size = DEFAULT_FRAGMENT_SIZE
+        self._fragment_size = cfg.transport.fragment_size or DEFAULT_FRAGMENT_SIZE
+        self._node_token = secrets.token_hex(16)
+        (
+            self._cert_pem,
+            self._key_pem,
+            self._cert_fingerprint,
+        ) = _generate_ephemeral_cert(self._node_token)
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._announce_handle = discovery.start_announce(self._cfg.transport.port)
+        self._announce_handle = discovery.start_announce(
+            self._cfg.transport.port,
+            cert_fingerprint=self._cert_fingerprint,
+            token=self._node_token,
+        )
         self._browser_handle = discovery.start_browse(
             lambda peers: asyncio.run_coroutine_threadsafe(
                 self._update_peers(peers), self._loop
@@ -140,6 +154,7 @@ class HHPTransport:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        self._peer_advertisements.clear()
         for task in list(self._client_tasks.values()):
             task.cancel()
         for task in list(self._client_tasks.values()):
@@ -158,25 +173,41 @@ class HHPTransport:
         if peer and peer in self._client_protocols:
             self._client_protocols.pop(peer, None)
 
-    async def _update_peers(self, peers: Set[Peer]) -> None:
+    async def _update_peers(self, peers: Set[discovery.PeerAdvertisement]) -> None:
+        advertisements = {
+            (adv.address, adv.port): adv for adv in peers
+        }
         existing = set(self._client_tasks.keys())
-        for peer in peers:
+        for peer, advertisement in advertisements.items():
             if (
                 self._announce_handle
+                and hmac.compare_digest(advertisement.token, self._announce_handle.token)
                 and peer[0] == self._announce_handle.address
                 and peer[1] == self._cfg.transport.port
             ):
                 continue
-            if peer not in existing:
-                self._client_tasks[peer] = asyncio.create_task(self._connect_peer(peer))
-        for peer in existing - peers:
-            task = self._client_tasks.pop(peer, None)
-            if task:
-                task.cancel()
-            self._client_protocols.pop(peer, None)
+            current_adv = self._peer_advertisements.get(peer)
+            if current_adv != advertisement:
+                await self._disconnect_peer(peer)
+            if peer not in self._client_tasks:
+                self._peer_advertisements[peer] = advertisement
+                self._client_tasks[peer] = asyncio.create_task(
+                    self._connect_peer(peer, advertisement)
+                )
+        for peer in existing - set(advertisements.keys()):
+            await self._disconnect_peer(peer)
 
-    async def _connect_peer(self, peer: Peer) -> None:
-        configuration = self._client_config()
+    async def _disconnect_peer(self, peer: Peer) -> None:
+        task = self._client_tasks.pop(peer, None)
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._client_protocols.pop(peer, None)
+        self._peer_advertisements.pop(peer, None)
+
+    async def _connect_peer(self, peer: Peer, advertisement: discovery.PeerAdvertisement) -> None:
+        configuration = self._client_config(advertisement)
         try:
             async with connect(
                 peer[0],
@@ -192,6 +223,11 @@ class HHPTransport:
         finally:
             self._client_protocols.pop(peer, None)
             self._client_tasks.pop(peer, None)
+            advertisement = self._peer_advertisements.get(peer)
+            if advertisement and peer not in self._client_tasks:
+                self._client_tasks[peer] = asyncio.create_task(
+                    self._connect_peer(peer, advertisement)
+                )
 
     async def transmit(self, tag: str, payload: bytes, *, cover: bool = False) -> None:
         if not payload and not cover:
@@ -249,25 +285,35 @@ class HHPTransport:
         if matched_tag is None or payload is None:
             return
         vec = tag_vec(matched_tag)
-        self._dag.insert_cell(vec.tobytes())
+        stored_payload = None if header.flags & FLAG_COVER else payload
+        self._dag.insert_cell(vec.tobytes(), stored_payload)
         self._metrics["fragments_rx"] = self._metrics.get("fragments_rx", 0) + 1
 
     def _server_config(self) -> QuicConfiguration:
         configuration = QuicConfiguration(is_client=False, alpn_protocols=["hhp/1"])
         configuration.max_datagram_frame_size = self._fragment_size
-        cert_pem, key_pem = _generate_ephemeral_cert(secrets.token_hex(6))
         with tempfile.NamedTemporaryFile(delete=False) as cert_file:
             cert_path = Path(cert_file.name)
-            cert_file.write(cert_pem + key_pem)
+            cert_file.write(self._cert_pem + self._key_pem)
         try:
             configuration.load_cert_chain(str(cert_path))
         finally:
             cert_path.unlink(missing_ok=True)
         return configuration
 
-    def _client_config(self) -> QuicConfiguration:
+    def _client_config(self, advertisement: discovery.PeerAdvertisement) -> QuicConfiguration:
         configuration = QuicConfiguration(is_client=True, alpn_protocols=["hhp/1"])
         configuration.max_datagram_frame_size = self._fragment_size
-        configuration.verify_mode = ssl.CERT_NONE
+        configuration.verify_mode = ssl.CERT_REQUIRED
+        expected = advertisement.fingerprint.lower()
+
+        def _verify_certificate(certificates, _ocsp_response, _scts, _hints) -> None:
+            if not certificates:
+                raise ssl.SSLError("peer certificate missing")
+            fingerprint = hashlib.sha256(certificates[0]).hexdigest().lower()
+            if not hmac.compare_digest(fingerprint, expected):
+                raise ssl.SSLError("peer fingerprint mismatch")
+
+        configuration.verify_certificate = _verify_certificate
         return configuration
 
